@@ -23,7 +23,7 @@ from frappe import DoesNotExistError, _
 from frappe.core.doctype.file.file import File, get_files_path
 from frappe.core.doctype.file.utils import decode_file_content, get_content_hash
 from frappe.model.rename_doc import rename_doc
-from frappe.utils import get_datetime, get_url
+from frappe.utils import cint, get_datetime, get_url
 from frappe.utils.image import optimize_image, strip_exif_data
 from magic import from_buffer
 from PIL import UnidentifiedImageError
@@ -107,7 +107,8 @@ class CloudStorageFile(File):
 		METHOD: after_insert
 		"""
 		if self.attached_to_doctype and self.attached_to_name and not self.file_association:  # type: ignore
-			if not self.content_hash and "/api/method/retrieve" in self.file_url:  # type: ignore
+			current_file_url = self.file_url or ""
+			if not self.content_hash and "/api/method/retrieve" in current_file_url:  # type: ignore
 				associated_doc = frappe.get_value("File", {"file_url": self.file_url}, "name")  # type: ignore
 			else:
 				associated_doc = frappe.get_value(
@@ -115,6 +116,10 @@ class CloudStorageFile(File):
 					{"content_hash": self.content_hash, "name": ["!=", self.name], "is_folder": False},  # type: ignore
 				)
 			if associated_doc and associated_doc != self.name:
+				# Clear only so the merge/delete hook does not drop the remote object.
+				# Restore the retrieve URL on the surviving row and on this document so
+				# the upload response still has /api/method/retrieve?key=...
+				object_path = object_path_for_file(self)
 				self.db_set(
 					"file_url", ""
 				)  # this is done to prevent deletion of the remote file with the delete_file hook
@@ -128,14 +133,14 @@ class CloudStorageFile(File):
 					ignore_permissions=True,
 					# validate=False,
 				)
+				restored = restore_retrieve_file_url(associated_doc, object_path)
+				if restored:
+					self.file_url = restored
 			if associated_doc and not self.s3_key:
-				s3_key = None
-				if "?key=" in self.file_url:
-					s3_key = self.file_url.split("?key=")[1]
-				elif "key=" in self.file_url:
-					s3_key = self.file_url.split("key=")[1].split("&")[0]
-				frappe.db.set_value("File", associated_doc, "s3_key", s3_key)
-				frappe.db.commit()
+				s3_key = path_from_file_url(self.file_url)
+				if s3_key:
+					frappe.db.set_value("File", associated_doc, "s3_key", s3_key)
+					frappe.db.commit()
 		elif self.attached_to_doctype and self.attached_to_name and self.file_name:  # type: ignore
 			associated_doc = frappe.db.get_value(
 				"File",
@@ -167,8 +172,15 @@ class CloudStorageFile(File):
 							"timestamp": get_datetime(),
 						},
 					)
+				object_path = object_path_for_file(self) or object_path_for_file(doc)
+				ensure_retrieve_file_url(doc, object_path)
 				doc.save()
+				# Clear before delete so the remote object shared with the surviving row is kept.
+				self.db_set("file_url", "")
 				frappe.delete_doc("File", self.name, ignore_permissions=True)
+				restored = restore_retrieve_file_url(associated_doc, object_path)
+				if restored:
+					self.file_url = restored
 
 	def on_trash(self) -> None:
 		"""
@@ -205,10 +217,7 @@ class CloudStorageFile(File):
 
 		if not attached_to_doctype:
 			return
-		if not self.file_url:  # type: ignore
-			client = get_cloud_storage_client()
-			path = get_file_path(self, client.folder)
-			self.file_url = FILE_URL.format(path=path)
+		ensure_retrieve_file_url(self)
 		if not self.content_hash and "/api/method/retrieve" in self.file_url:  # type: ignore
 			associated_doc = frappe.get_value("File", {"file_url": self.file_url}, "name")  # type: ignore
 		else:
@@ -223,6 +232,9 @@ class CloudStorageFile(File):
 			existing_file.append(
 				"file_association",
 				add_child_file_association(attached_to_doctype, attached_to_name),
+			)
+			ensure_retrieve_file_url(
+				existing_file, object_path_for_file(self) or object_path_for_file(existing_file)
 			)
 			existing_file.save()
 		else:
@@ -515,21 +527,186 @@ def validate_config() -> None:
 		)
 
 
+def file_is_private(is_private) -> bool:
+	"""Check and string \"0\" are public. Only a real private flag needs a File read check."""
+	return bool(cint(is_private))
+
+
+def cloud_storage_active() -> bool:
+	settings = frappe.conf.get("cloud_storage_settings")
+	return bool(settings) and not settings.get("use_local")
+
+
+def path_from_file_url(file_url: str | None) -> str | None:
+	if not file_url or "key=" not in file_url:
+		return None
+	key = unquote(file_url.split("key=", 1)[1].split("&", 1)[0]).strip()
+	return key or None
+
+
+def object_path_for_file(file, fallback_path: str | None = None) -> str | None:
+	path = (
+		getattr(file, "s3_key", None)
+		or path_from_file_url(getattr(file, "file_url", None))
+		or fallback_path
+	)
+	if path:
+		return path
+	if not cloud_storage_active():
+		return None
+	folder = (frappe.conf.get("cloud_storage_settings") or {}).get("folder")
+	return get_file_path(file, folder) or None
+
+
+def ensure_retrieve_file_url(file, path: str | None = None) -> str:
+	"""Keep a cloud File row addressable via /api/method/retrieve?key={path}.
+
+	Sets the attribute so the upload response is never file_url \"\". Persists when the
+	row already exists. Private files still get a retrieve URL; retrieve() enforces read.
+	"""
+	if not cloud_storage_active():
+		return getattr(file, "file_url", None) or ""
+
+	current = getattr(file, "file_url", None) or ""
+	if current.startswith("/api/method/retrieve") and "key=" in current:
+		return current
+
+	path = path or object_path_for_file(file)
+	url = FILE_URL.format(path=path) if path else ""
+	if not url:
+		return current
+
+	file.file_url = url
+	name = getattr(file, "name", None)
+	if name and not file.is_new() and frappe.db.exists("File", name):
+		frappe.db.set_value("File", name, "file_url", url, update_modified=False)
+	return url
+
+
+def restore_retrieve_file_url(file_name: str, path: str | None = None) -> str:
+	"""Put the retrieve URL back on the row clients still see after a merge clears it."""
+	if not file_name or not cloud_storage_active():
+		return FILE_URL.format(path=path) if path else ""
+	if not frappe.db.exists("File", file_name):
+		return FILE_URL.format(path=path) if path else ""
+
+	current = frappe.db.get_value("File", file_name, ["file_url", "s3_key"], as_dict=True) or {}
+	existing = current.get("file_url") or ""
+	if existing.startswith("/api/method/retrieve") and "key=" in existing:
+		return existing
+
+	path = path or current.get("s3_key")
+	if not path:
+		path = object_path_for_file(frappe.get_doc("File", file_name))
+	url = FILE_URL.format(path=path) if path else ""
+	if not url:
+		return ""
+
+	frappe.db.set_value("File", file_name, "file_url", url, update_modified=False)
+	if path and not current.get("s3_key"):
+		frappe.db.set_value("File", file_name, "s3_key", path, update_modified=False)
+	return url
+
+
+def _row_get(row, field, default=None):
+	if row is None:
+		return default
+	if isinstance(row, dict):
+		return row.get(field, default)
+	return getattr(row, field, default)
+
+
+def prefer_public_file(rows):
+	"""When several File rows match, serve a public sibling instead of a private one."""
+	if not rows:
+		return None
+	for row in rows:
+		if not file_is_private(_row_get(row, "is_private")):
+			return row
+	return rows[0]
+
+
+def _retrieve_lookup_keys(key: str) -> list[str]:
+	raw = (key or "").strip()
+	if not raw:
+		return []
+	decoded = unquote(raw)
+	keys = [raw]
+	if decoded and decoded not in keys:
+		keys.append(decoded)
+	return keys
+
+
+def resolve_file_for_retrieve(key: str):
+	"""Find the File to authorize for retrieve.
+
+	Lookup order: s3_key, then File.name (clients sometimes pass the document name,
+	not the uploaded content hash), then file_url containing the key. Prefer
+	is_private=0 so a private sibling does not block public lesson media.
+	"""
+	fields = ["name", "is_private", "s3_key", "file_url"]
+	keys = _retrieve_lookup_keys(key)
+	if not keys:
+		return None
+
+	def matching(filters: dict):
+		return frappe.get_all("File", filters=filters, fields=fields, limit_page_length=20)
+
+	rows = []
+	for candidate in keys:
+		rows = matching({"s3_key": candidate, "is_private": 0}) or matching({"s3_key": candidate})
+		if rows:
+			break
+
+	if not rows:
+		for candidate in keys:
+			rows = matching({"name": candidate, "is_private": 0}) or matching({"name": candidate})
+			if rows:
+				break
+
+	if not rows:
+		for candidate in keys:
+			rows = matching({"file_url": ["like", f"%{candidate}%"], "is_private": 0}) or matching(
+				{"file_url": ["like", f"%{candidate}%"]}
+			)
+			if rows:
+				break
+
+	chosen = prefer_public_file(rows)
+	if not chosen:
+		return None
+
+	# A name/url hit can be a private sibling. Prefer a public row that shares its object key.
+	if file_is_private(_row_get(chosen, "is_private")):
+		object_key = _row_get(chosen, "s3_key") or path_from_file_url(_row_get(chosen, "file_url"))
+		if object_key:
+			siblings = matching({"s3_key": object_key, "is_private": 0}) or matching({"s3_key": object_key})
+			public = prefer_public_file(siblings)
+			if public and not file_is_private(_row_get(public, "is_private")):
+				return public
+	return chosen
+
+
 def get_presigned_url(client, key: str):
-	file = frappe.get_value("File", {"s3_key": key}, ["name", "is_private"], as_dict=True)
+	file = resolve_file_for_retrieve(key)
 	if not file:
 		raise DoesNotExistError(frappe._("The file you are looking for is not available"))
-	expiration = client.expiration if file.is_private else None
 
-	if file.is_private:
-		file_doc = frappe.get_doc("File", file.name)
+	object_key = _row_get(file, "s3_key") or path_from_file_url(_row_get(file, "file_url")) or key
+	is_private = file_is_private(_row_get(file, "is_private"))
+	expiration = client.expiration if is_private else None
+
+	# Public media (including is_private "0") must not hit File role permissions.
+	# Private instructor files keep the existing read check.
+	if is_private:
+		file_doc = frappe.get_doc("File", _row_get(file, "name"))
 		frappe.has_permission(
 			doctype="File", ptype="read", doc=file_doc, user=frappe.session.user, throw=True
 		)
 
 	return client.generate_presigned_url(
 		ClientMethod="get_object",
-		Params={"Bucket": client.bucket, "Key": key},
+		Params={"Bucket": client.bucket, "Key": object_key},
 		ExpiresIn=expiration,
 	)
 
@@ -547,7 +724,11 @@ def get_sharing_url(client, key: str) -> str:
 def upload_file(file: File) -> File:
 	client = get_cloud_storage_client()
 	path = get_file_path(file, client.folder)
-	file.db_set("file_url", FILE_URL.format(path=path))
+	# Set the attribute even when the row is not inserted yet (before_insert). db_set
+	# alone can leave the serialized upload response with file_url "".
+	file.file_url = FILE_URL.format(path=path)
+	if not file.is_new() and file.name and frappe.db.exists("File", file.name):
+		file.db_set("file_url", file.file_url)
 	content_type = file.content_type or from_buffer(file.content, mime=True)
 	version_id = None
 	try:
@@ -562,7 +743,10 @@ def upload_file(file: File) -> File:
 		frappe.log_error("File Upload Error", e)
 	if version_id:
 		file.add_file_version(version_id)
-	file.db_set("s3_key", path)
+	file.s3_key = path
+	if not file.is_new() and file.name and frappe.db.exists("File", file.name):
+		file.db_set("s3_key", path)
+	ensure_retrieve_file_url(file, path)
 	return file
 
 
@@ -636,6 +820,10 @@ def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
 		file_doc: File = frappe.get_doc("File", existing_file_hashes[0])
 		file_doc.associate_files(file.attached_to_doctype, file.attached_to_name)
 		file_doc.save()
+		path = object_path_for_file(file_doc) or object_path_for_file(file)
+		ensure_retrieve_file_url(file_doc, path)
+		# Upload ignores write_file's return and serializes this document. Copy the URL.
+		ensure_retrieve_file_url(file, path)
 		return file_doc
 
 	# if a filename-conflict is found, update the existing document with a new version instead
@@ -643,6 +831,7 @@ def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
 		"File", filters={"name": ["!=", file.name], "file_name": file.file_name}, pluck="name"
 	)
 
+	incoming = file
 	if existing_file_names:
 		file_doc = frappe.get_doc("File", existing_file_names[0])
 		file_doc.update(
@@ -660,7 +849,12 @@ def write_file(file: File, remove_spaces_in_file_name: bool = True) -> File:
 
 	file.file_name = strip_special_chars(file.file_name)
 	file.flags.cloud_storage = True
-	return upload_file(file)
+	uploaded = upload_file(file)
+	path = object_path_for_file(uploaded)
+	ensure_retrieve_file_url(uploaded, path)
+	if incoming is not uploaded:
+		ensure_retrieve_file_url(incoming, path)
+	return uploaded
 
 
 @frappe.whitelist()

@@ -3,6 +3,7 @@
 
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import frappe
 import pytest
@@ -10,7 +11,11 @@ from werkzeug.datastructures import FileMultiDict
 
 from cloud_storage.cloud_storage.overrides.file import (
 	CloudStorageFile,
+	file_is_private,
 	get_cloud_storage_client,
+	get_presigned_url,
+	prefer_public_file,
+	resolve_file_for_retrieve,
 	retrieve,
 )
 from cloud_storage.migration import migrate_files
@@ -231,3 +236,113 @@ def test_migration_command(example_file_record_6):
 	s3_file_size = response["ContentLength"]
 
 	assert s3_file_size == original_file_size
+
+
+def test_file_is_private_treats_string_zero_as_public():
+	assert file_is_private("0") is False
+	assert file_is_private(0) is False
+	assert file_is_private(False) is False
+	assert file_is_private("1") is True
+	assert file_is_private(1) is True
+
+
+def test_prefer_public_file_over_private_sibling():
+	private = {"name": "0f81ec520b", "is_private": 1, "s3_key": "lesson/image.png"}
+	public = {"name": "71ed6cad97", "is_private": "0", "s3_key": "lesson/image.png"}
+	chosen = prefer_public_file([private, public])
+	assert chosen["name"] == "71ed6cad97"
+
+
+def test_get_presigned_url_skips_permission_for_public_sibling(monkeypatch):
+	public = {
+		"name": "71ed6cad97",
+		"is_private": "0",
+		"s3_key": "lesson/image.png",
+		"file_url": "/api/method/retrieve?key=lesson/image.png",
+	}
+	private = {
+		"name": "0f81ec520b",
+		"is_private": 1,
+		"s3_key": "lesson/image.png",
+		"file_url": "/api/method/retrieve?key=lesson/image.png",
+	}
+
+	def fake_get_all(doctype, filters=None, fields=None, limit_page_length=None):
+		assert doctype == "File"
+		if filters.get("s3_key") == "lesson/image.png" and filters.get("is_private") == 0:
+			return [public]
+		if filters.get("s3_key") == "lesson/image.png":
+			return [private, public]
+		return []
+
+	permission = MagicMock()
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.get_all", fake_get_all)
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.has_permission", permission)
+
+	client = MagicMock()
+	client.bucket = "test_bucket"
+	client.expiration = 110
+	client.generate_presigned_url.return_value = "https://signed.example/object"
+
+	signed = get_presigned_url(client, "lesson/image.png")
+
+	assert signed == "https://signed.example/object"
+	permission.assert_not_called()
+	client.generate_presigned_url.assert_called_once()
+	assert client.generate_presigned_url.call_args.kwargs["Params"]["Key"] == "lesson/image.png"
+	assert client.generate_presigned_url.call_args.kwargs["ExpiresIn"] is None
+
+
+def test_get_presigned_url_keeps_permission_check_for_private_only(monkeypatch):
+	private = {
+		"name": "0f81ec520b",
+		"is_private": 1,
+		"s3_key": "instructor/notes.pdf",
+		"file_url": "/api/method/retrieve?key=instructor/notes.pdf",
+	}
+
+	def fake_get_all(doctype, filters=None, fields=None, limit_page_length=None):
+		if filters.get("s3_key") == "instructor/notes.pdf" and filters.get("is_private") == 0:
+			return []
+		if filters.get("s3_key") == "instructor/notes.pdf":
+			return [private]
+		return []
+
+	permission = MagicMock()
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.get_all", fake_get_all)
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.get_doc", MagicMock(return_value=private))
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.has_permission", permission)
+
+	client = MagicMock()
+	client.bucket = "test_bucket"
+	client.expiration = 110
+	client.generate_presigned_url.return_value = "https://signed.example/private"
+
+	get_presigned_url(client, "instructor/notes.pdf")
+
+	permission.assert_called_once()
+	assert permission.call_args.kwargs["throw"] is True
+	assert client.generate_presigned_url.call_args.kwargs["ExpiresIn"] == 110
+
+
+def test_resolve_file_for_retrieve_falls_back_to_name_and_file_url(monkeypatch):
+	by_name = {
+		"name": "0f81ec520b",
+		"is_private": 0,
+		"s3_key": "lesson/image.png",
+		"file_url": "/api/method/retrieve?key=lesson/image.png",
+	}
+	calls = []
+
+	def fake_get_all(doctype, filters=None, fields=None, limit_page_length=None):
+		calls.append(filters)
+		if filters.get("name") == "0f81ec520b" and filters.get("is_private") == 0:
+			return [by_name]
+		return []
+
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.get_all", fake_get_all)
+
+	resolved = resolve_file_for_retrieve("0f81ec520b")
+	assert resolved["name"] == "0f81ec520b"
+	assert {"s3_key": "0f81ec520b", "is_private": 0} in calls
+	assert {"name": "0f81ec520b", "is_private": 0} in calls
