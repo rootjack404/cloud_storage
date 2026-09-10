@@ -563,24 +563,37 @@ def ensure_retrieve_file_url(file, path: str | None = None) -> str:
 
 	Sets the attribute so the upload response is never file_url \"\". Persists when the
 	row already exists. Private files still get a retrieve URL; retrieve() enforces read.
+	Also keeps ``s3_key`` in sync — retrieve used to find a private sibling by s3_key
+	while the public upload only had file_url, then 403 LMS students.
 	"""
 	if not cloud_storage_active():
 		return getattr(file, "file_url", None) or ""
 
+	path = path or object_path_for_file(file)
 	current = getattr(file, "file_url", None) or ""
 	if current.startswith("/api/method/retrieve") and "key=" in current:
-		return current
+		url = current
+		if not path:
+			path = path_from_file_url(current)
+	else:
+		url = FILE_URL.format(path=path) if path else ""
+		if not url:
+			return current
+		file.file_url = url
 
-	path = path or object_path_for_file(file)
-	url = FILE_URL.format(path=path) if path else ""
-	if not url:
-		return current
+	if path:
+		file.s3_key = path
 
-	file.file_url = url
 	name = getattr(file, "name", None)
 	if name and not file.is_new() and frappe.db.exists("File", name):
-		frappe.db.set_value("File", name, "file_url", url, update_modified=False)
-	return url
+		values = {}
+		if url:
+			values["file_url"] = url
+		if path:
+			values["s3_key"] = path
+		if values:
+			frappe.db.set_value("File", name, values, update_modified=False)
+	return url or current
 
 
 def restore_retrieve_file_url(file_name: str, path: str | None = None) -> str:
@@ -640,9 +653,10 @@ def _retrieve_lookup_keys(key: str) -> list[str]:
 def resolve_file_for_retrieve(key: str):
 	"""Find the File to authorize for retrieve.
 
-	Lookup order: s3_key, then File.name (clients sometimes pass the document name,
-	not the uploaded content hash), then file_url containing the key. Prefer
-	is_private=0 so a private sibling does not block public lesson media.
+	Collect matches from s3_key, file_url, and File.name, then prefer is_private=0.
+	A private duplicate often keeps ``s3_key`` while a new public upload only has
+	``file_url`` (merge / empty s3_key). Looking up s3_key alone used to pick the
+	private row and 403 LMS students with "No permission for File <hash>".
 	"""
 	fields = ["name", "is_private", "s3_key", "file_url"]
 	keys = _retrieve_lookup_keys(key)
@@ -652,38 +666,49 @@ def resolve_file_for_retrieve(key: str):
 	def matching(filters: dict):
 		return frappe.get_all("File", filters=filters, fields=fields, limit_page_length=20)
 
-	rows = []
+	candidates: list = []
+	seen: set[str] = set()
+
+	def add_rows(rows):
+		for row in rows or []:
+			name = _row_get(row, "name")
+			if not name or name in seen:
+				continue
+			seen.add(name)
+			candidates.append(row)
+
+	# Public hits across every lookup key first.
 	for candidate in keys:
-		rows = matching({"s3_key": candidate, "is_private": 0}) or matching({"s3_key": candidate})
-		if rows:
-			break
+		add_rows(matching({"s3_key": candidate, "is_private": 0}))
+		add_rows(matching({"file_url": ["like", f"%{candidate}%"], "is_private": 0}))
+		add_rows(matching({"name": candidate, "is_private": 0}))
 
-	if not rows:
-		for candidate in keys:
-			rows = matching({"name": candidate, "is_private": 0}) or matching({"name": candidate})
-			if rows:
-				break
+	chosen = prefer_public_file(candidates)
+	if chosen and not file_is_private(_row_get(chosen, "is_private")):
+		return chosen
 
-	if not rows:
-		for candidate in keys:
-			rows = matching({"file_url": ["like", f"%{candidate}%"], "is_private": 0}) or matching(
-				{"file_url": ["like", f"%{candidate}%"]}
-			)
-			if rows:
-				break
+	# No public row — include private matches for owner / desk retrieve.
+	for candidate in keys:
+		add_rows(matching({"s3_key": candidate}))
+		add_rows(matching({"file_url": ["like", f"%{candidate}%"]}))
+		add_rows(matching({"name": candidate}))
 
-	chosen = prefer_public_file(rows)
+	chosen = prefer_public_file(candidates)
 	if not chosen:
 		return None
 
-	# A name/url hit can be a private sibling. Prefer a public row that shares its object key.
-	if file_is_private(_row_get(chosen, "is_private")):
-		object_key = _row_get(chosen, "s3_key") or path_from_file_url(_row_get(chosen, "file_url"))
-		if object_key:
-			siblings = matching({"s3_key": object_key, "is_private": 0}) or matching({"s3_key": object_key})
-			public = prefer_public_file(siblings)
-			if public and not file_is_private(_row_get(public, "is_private")):
-				return public
+	if not file_is_private(_row_get(chosen, "is_private")):
+		return chosen
+
+	# Private primary hit: still prefer a public sibling that only has file_url.
+	object_key = _row_get(chosen, "s3_key") or path_from_file_url(_row_get(chosen, "file_url")) or key
+	sibling_keys = _retrieve_lookup_keys(object_key)
+	for candidate in sibling_keys:
+		add_rows(matching({"s3_key": candidate, "is_private": 0}))
+		add_rows(matching({"file_url": ["like", f"%{candidate}%"], "is_private": 0}))
+	public = prefer_public_file(candidates)
+	if public and not file_is_private(_row_get(public, "is_private")):
+		return public
 	return chosen
 
 

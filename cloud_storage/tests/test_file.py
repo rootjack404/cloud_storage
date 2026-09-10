@@ -325,6 +325,53 @@ def test_get_presigned_url_keeps_permission_check_for_private_only(monkeypatch):
 	assert client.generate_presigned_url.call_args.kwargs["ExpiresIn"] == 110
 
 
+def test_resolve_prefers_public_file_url_over_private_s3_key(monkeypatch):
+	"""Regression: private sibling keeps s3_key; public upload only has file_url."""
+	private = {
+		"name": "59a23c4638",
+		"is_private": 1,
+		"s3_key": "lms.sipinstitute.id/No Doctype/16297.jpg",
+		"file_url": "",
+	}
+	public = {
+		"name": "65b6379bbb",
+		"is_private": 0,
+		"s3_key": None,
+		"file_url": "/api/method/retrieve?key=lms.sipinstitute.id/No Doctype/16297.jpg",
+	}
+	key = "lms.sipinstitute.id/No Doctype/16297.jpg"
+
+	def fake_get_all(doctype, filters=None, fields=None, limit_page_length=None):
+		filters = filters or {}
+		if filters.get("s3_key") == key and filters.get("is_private") == 0:
+			return []
+		if filters.get("s3_key") == key:
+			return [private]
+		if (
+			isinstance(filters.get("file_url"), (list, tuple))
+			and filters.get("is_private") == 0
+			and key in str(filters.get("file_url")[1])
+		):
+			return [public]
+		if isinstance(filters.get("file_url"), (list, tuple)) and key in str(filters.get("file_url")[1]):
+			return [public]
+		return []
+
+	permission = MagicMock()
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.get_all", fake_get_all)
+	monkeypatch.setattr("cloud_storage.cloud_storage.overrides.file.frappe.has_permission", permission)
+
+	client = MagicMock()
+	client.bucket = "test_bucket"
+	client.expiration = 110
+	client.generate_presigned_url.return_value = "https://signed.example/public"
+
+	assert resolve_file_for_retrieve(key)["name"] == "65b6379bbb"
+	signed = get_presigned_url(client, key)
+	assert signed == "https://signed.example/public"
+	permission.assert_not_called()
+
+
 def test_resolve_file_for_retrieve_falls_back_to_name_and_file_url(monkeypatch):
 	by_name = {
 		"name": "0f81ec520b",
