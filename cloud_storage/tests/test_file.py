@@ -17,6 +17,7 @@ from cloud_storage.cloud_storage.overrides.file import (
 	prefer_public_file,
 	resolve_file_for_retrieve,
 	retrieve,
+	ensure_retrieve_file_url,
 )
 from cloud_storage.migration import migrate_files
 
@@ -393,3 +394,55 @@ def test_resolve_file_for_retrieve_falls_back_to_name_and_file_url(monkeypatch):
 	assert resolved["name"] == "0f81ec520b"
 	assert {"s3_key": "0f81ec520b", "is_private": 0} in calls
 	assert {"name": "0f81ec520b", "is_private": 0} in calls
+
+
+def test_data_import_file_stays_on_filesystem(example_file_record_5):
+	"""Data Import must keep a local file_url; rewriting to retrieve caused NoSuchKey."""
+	frappe.set_user("Administrator")
+	file = create_upload_file(
+		example_file_record_5,
+		doctype="Data Import",
+		docname="User Import test",
+		file_name="import_users.csv",
+	)
+
+	assert frappe.db.exists("File", file.name)
+	assert file.attached_to_doctype == "Data Import"
+	assert not (file.file_url or "").startswith("/api/method/retrieve")
+	assert "/files/" in (file.file_url or "")
+	assert not file.s3_key
+
+	# validate/associate_files must not rewrite local Data Import URLs
+	ensure_retrieve_file_url(file)
+	assert not (file.file_url or "").startswith("/api/method/retrieve")
+
+	content = file.get_content()
+	assert content is not None
+	assert len(content) > 0
+
+
+def test_get_content_falls_back_when_retrieve_key_missing(example_file_record_5):
+	"""Broken rows: retrieve URL + s3_key but object never uploaded (legacy Data Import)."""
+	frappe.set_user("Administrator")
+	file = create_upload_file(
+		example_file_record_5,
+		doctype="Data Import",
+		docname="User Import fallback",
+		file_name="import_fallback.csv",
+	)
+	local_path = frappe.get_site_path(
+		"private" if file.is_private else "public", "files", file.file_name
+	)
+	assert Path(local_path).exists()
+
+	file.db_set(
+		"file_url",
+		"/api/method/retrieve?key=missing/folder/import_fallback.csv",
+		update_modified=False,
+	)
+	file.db_set("s3_key", "missing/folder/import_fallback.csv", update_modified=False)
+	file.reload()
+
+	content = file.get_content()
+	assert content is not None
+	assert len(content) > 0

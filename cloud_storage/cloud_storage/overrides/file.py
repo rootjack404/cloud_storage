@@ -324,25 +324,44 @@ class CloudStorageFile(File):
 			self.validate_file_url()
 
 		if self.file_url.startswith("/api/method/retrieve"):
-			client = get_cloud_storage_client()
-			file_object = client.get_object(Bucket=client.bucket, Key=self.s3_key)
-			self._content = file_object.get("Body").read()
+			self._content = self._get_content_from_retrieve_url()
 		elif self.file_url.startswith("http://") or self.file_url.startswith("https://"):
 			self._content = urlopen(self.file_url).read()
 		else:
-			if not self.is_private:
-				file_path = frappe.get_site_path("public", "files", self.file_name)
-			else:
-				file_path = frappe.get_site_path("private", "files", self.file_name)
-			with open(file_path, mode="rb") as f:
-				self._content = f.read()
-				try:
-					# for plain text files
-					self._content = self._content.decode()
-				except UnicodeDecodeError:
-					# for .png, .jpg, etc
-					pass
+			self._content = self._read_content_from_filesystem()
 		return self._content
+
+	def _read_content_from_filesystem(self):
+		if not self.is_private:
+			file_path = frappe.get_site_path("public", "files", self.file_name)
+		else:
+			file_path = frappe.get_site_path("private", "files", self.file_name)
+		with open(file_path, mode="rb") as f:
+			content = f.read()
+			try:
+				# for plain text files
+				return content.decode()
+			except UnicodeDecodeError:
+				# for .png, .jpg, .xlsx, etc
+				return content
+
+	def _get_content_from_retrieve_url(self):
+		"""Read from S3; fall back to site files when the object was never uploaded.
+
+		Data Import attachments are written to the filesystem only, but older rows
+		may still have a retrieve URL + s3_key from ensure_retrieve_file_url.
+		"""
+		key = self.s3_key or path_from_file_url(self.file_url)
+		if key:
+			try:
+				client = get_cloud_storage_client()
+				file_object = client.get_object(Bucket=client.bucket, Key=key)
+				return file_object.get("Body").read()
+			except ClientError as e:
+				error_code = e.response.get("Error", {}).get("Code")
+				if error_code not in ("NoSuchKey", "404", "NotFound"):
+					raise
+		return self._read_content_from_filesystem()
 
 	def get_full_path(self):
 		"""
@@ -537,6 +556,11 @@ def cloud_storage_active() -> bool:
 	return bool(settings) and not settings.get("use_local")
 
 
+def is_filesystem_only_attachment(file) -> bool:
+	"""Attachments that write_file keeps on the site filesystem (never uploaded to S3)."""
+	return getattr(file, "attached_to_doctype", None) == "Data Import"
+
+
 def path_from_file_url(file_url: str | None) -> str | None:
 	if not file_url or "key=" not in file_url:
 		return None
@@ -565,8 +589,13 @@ def ensure_retrieve_file_url(file, path: str | None = None) -> str:
 	row already exists. Private files still get a retrieve URL; retrieve() enforces read.
 	Also keeps ``s3_key`` in sync — retrieve used to find a private sibling by s3_key
 	while the public upload only had file_url, then 403 LMS students.
+
+	Data Import files are never uploaded (write_file saves them locally). Do not rewrite
+	their file_url to retrieve — that produces NoSuchKey when Data Import reads content.
 	"""
 	if not cloud_storage_active():
+		return getattr(file, "file_url", None) or ""
+	if is_filesystem_only_attachment(file):
 		return getattr(file, "file_url", None) or ""
 
 	path = path or object_path_for_file(file)
@@ -603,7 +632,14 @@ def restore_retrieve_file_url(file_name: str, path: str | None = None) -> str:
 	if not frappe.db.exists("File", file_name):
 		return FILE_URL.format(path=path) if path else ""
 
-	current = frappe.db.get_value("File", file_name, ["file_url", "s3_key"], as_dict=True) or {}
+	current = (
+		frappe.db.get_value(
+			"File", file_name, ["file_url", "s3_key", "attached_to_doctype"], as_dict=True
+		)
+		or {}
+	)
+	if current.get("attached_to_doctype") == "Data Import":
+		return current.get("file_url") or ""
 	existing = current.get("file_url") or ""
 	if existing.startswith("/api/method/retrieve") and "key=" in existing:
 		return existing
